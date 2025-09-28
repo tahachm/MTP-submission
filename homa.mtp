@@ -1,0 +1,1464 @@
+event SEND_REQUEST : APP_EVENT {
+    uint32 msg_len;
+    addr_t addr;
+    uint16 src_port;
+    uint16 dest_port;
+    uint32 remote_ip;
+}
+
+event SEND_RESPONSE : APP_EVENT {
+    uint32 msg_len;
+    addr_t addr;
+    uint16 src_port;
+    uint16 dest_port;
+    uint64 rpcid;
+    uint32 remote_ip;
+}
+
+event COMMON_EVENT : NET_EVENT {
+    uint16 sport;
+    uint16 dport;
+    uint8 doff;
+    uint8 type;
+    uint16 seq;
+    uint64 sender_id;
+}
+
+// Client received response
+event RECVD_RESPONSE : COMMON_EVENT {
+    uint32 message_length;
+    uint32 incoming;
+    uint8 retransmit;
+
+    uint32 offset;
+    uint32 segment_length;
+
+    uint64 rpcid;
+    uint16 sport;
+    uint16 dport;
+
+    bool single_packet;
+    uint32 remote_ip;
+
+    addr_t hold_addr;
+}
+
+// Server received request
+event RECVD_REQUEST : COMMON_EVENT {
+    uint32 message_length;
+    uint32 incoming;
+    uint8 retransmit;
+
+    uint32 offset;
+    uint32 segment_length;
+
+    uint64 rpcid;
+    uint16 sport;
+    uint16 dport;
+
+    bool single_packet;
+    uint32 remote_ip;
+
+    addr_t hold_addr;
+}
+
+event RECVD_RESEND : COMMON_EVENT {
+    uint32 offset;
+    uint32 length;
+    uint8 priority;
+}
+
+event RECVD_UNKNOWN : COMMON_EVENT {
+}
+
+event RECVD_GRANT : COMMON_EVENT {
+    uint32 offset;
+    uint8 priority;
+    uint8 resend_all;
+}
+
+event RECVD_BUSY : COMMON_EVENT {
+}
+
+event TIMEOUT_RESEND : TIMER_EVENT {
+}
+
+
+/**************  Homa packet blueprint  ***************/
+
+struct homa_ack {
+    uint64 rpcid;
+    uint16 sport;
+    uint16 dport;
+}
+
+struct data_segment {
+    uint32 offset;
+    uint32 segment_length;
+    homa_ack ack;
+}
+
+pkt_bp DATA_HDR {
+    uint32 message_length;
+    uint32 incoming;
+    uint16 cutoff_version;
+    uint8 retransmit;
+    uint8 unused1;
+    data_segment seg;
+}
+
+pkt_bp RESEND_HDR {
+    uint32 offset;
+    uint32 length;
+    uint8 priority;
+}
+
+pkt_bp GRANT_HDR {
+    uint32 offset;
+    uint8 priority;
+    uint8 resend_all;
+}
+
+pkt_bp COMMON_HDR {
+    uint16 src_port;
+    uint16 dest_port;
+    uint32 unused1;
+    uint32 unused2;
+    uint8  doff;
+    uint8  type;
+    uint16 seq;
+    checksum16_t checksum;
+    uint16 unused4;
+    uint64 sender_id;
+}
+
+pkt_bp HOMABP {
+    COMMON_HDR common;
+    GRANT_HDR grant;
+    RESEND_HDR resend;
+    DATA_HDR data;
+    uint8 priority;
+    data_t payload;
+}
+
+pkt_bp HOMABP {
+    COMMON_HDR common;
+    bp_union<GRANT_HDR, RESEND_HDR, DATA_HDR> next_hdr;
+    uint8 priority;
+    data_t payload;
+}
+
+/****************** contexts and other structs **************/
+
+uint8 RPC_IN_SERVICE = 8;
+uint8 RPC_INCOMING = 6;
+uint8 RPC_OUTGOING = 5;
+uint8 RPC_DEAD = 0;
+
+uint8 GRANT = 17;
+uint8 DATA = 16;
+uint8 BUSY = 14;
+uint8 UNKNOWN = 13;
+uint8 RESEND = 12;
+
+uint8 ABORT_RESEND = 10;
+uint8 RESEND_TICK = 15;
+uint8 HOMA_MAX_PRIORITIES = 8;
+
+context homa_context {
+    flow_id_t fid;
+    uint32 HOMA_MSS = 1514 - 14 - 20 - 60; // Last is DATA_HDR size
+    uint32 curr_offset = 0;
+    uint32 rest_msg_len = 0;
+    bool first_packet = 1;
+    uint32 seq = 0;
+
+    uint8  state;
+    uint32 message_length;
+    uint64 buffer_head;
+    uint16 remote_port;
+    uint16 local_port;
+    uint32 remote_ip;
+    uint64 id;
+    bool rpc_is_client;
+    uint32 resend_count;
+    uint16 expected_segment_cnt;
+    sliding_wnd rcvd_seqs;
+
+    uint64 cc_granted;
+    uint32 cc_incoming;
+    uint32 cc_bytes_remaining;
+    uint32 cc_sched_prio;
+
+    uint64 birth;
+
+    uint8 busy_count;
+
+    // Unique to timer
+    uint8 last_busy_count;
+    uint32 silent_ticks;
+
+    uint32 last_cc_bytes_remaining;
+    uint64 last_cc_granted;
+    uint32 last_cc_incoming;
+    uint32 last_resend_count;
+
+    timer_t timeout_res;
+}
+
+context sock_context {
+    uint32 local_ip;
+    uint32 local_port;
+    id_list<uint64> cur_rpcs;
+}
+
+struct rpc_info_1 {
+    uint16 peer_id;
+    uint32 bytes_remaining;
+    uint64 rpcid;
+    uint16 local_port;
+    uint16 remote_port;
+    uint32 remote_ip;
+    uint32 incoming;
+    uint64 birth;
+    bool in_prio_list;
+}
+
+struct rpc_info_2 {
+    uint32 bytes_remaining;
+    uint16 peer_id;
+    uint64 rpcid;
+    uint16 local_port;
+    uint16 remote_port;
+    uint32 remote_ip;
+    uint32 message_length;
+    uint32 incoming;
+}
+
+struct rinfo {
+    uint16 peer_id;
+    uint64 rpcid;
+    uint16 local_port;
+    uint16 remote_port;
+    uint32 remote_ip;
+    uint32 newgrant;
+    uint8 priority;
+};
+
+context global_grant_context {
+    // sorted_list<X, Y>: X is type, Y is how many bits
+    //                    from the beginning is for comparison
+    //                    could potentially change this to just take the
+    //                    sequence of fields used for comparison
+    sorted_list<rpc_info_1, 176> all_rpcs;
+    sorted_list<rpc_info_2, 48> highest_prio_rpcs;
+
+    bool finish_grant_choose = false;
+    rinfo ri[HOMA_OVERCOMMITMENT];
+    bool remove[HOMA_OVERCOMMITMENT];
+
+    uint64 total_incoming;
+    int grant_nonfifo_left;
+    bool need_grant_fifo;
+    uint16 nr_grant_candidate;
+    uint16 nr_grant_ready;
+    uint16 granting_idx = 0;
+
+    uint32 local_ip;
+
+}
+
+struct grant_info {
+    uint16 sport;
+    uint16 dport;
+    uint64 rpcid;
+    uint32 newgrant;
+    uint32 remote_ip;
+    uint8 priority;
+};
+
+interm_output interm_out {
+    uint8 type_pkt;
+    bool complete = false;
+    bool new_state = false;
+    bool needs_schedule = false;
+    bool dup_data_pkt = false;
+    uint32 last_bytes_remaining = 0;
+    bool last_grant = false;
+    bool send_fifo_rpc = false;
+
+    bool skip_timer_ep = false;
+}
+
+
+/************************ event processor declarations **************************/
+
+list<instr_t> send_req_ep (SEND_REQUEST ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> send_resp_ep (SEND_RESPONSE ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> recv_resp_ep (RECVD_RESPONSE ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> recv_resend_ep (RECVD_RESEND ev, homa_context ctx, interm_out int_out);
+list<instr_t> tx_resend_resp (RECVD_RESEND ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> recv_unkown_ep (RECVD_UNKNOWN ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> recv_grant_ep (RECVD_GRANT ev, homa_context ctx, interm_out int_out);
+
+void recv_busy_ep (RECVD_BUSY ev, homa_context ctx, interm_out int_out);
+
+list<instr_t> timeout_resend_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out);
+list<instr_t> generate_resend_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out);
+list<instr_t> reset_timeout_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out);
+
+
+/*************************** dispatcher ************************/
+
+dispatch disp_table {
+    SEND_REQUEST    -> {send_req_ep};
+    SEND_RESPONSE   -> {send_resp_ep};
+    NO_HOMA_CTX     -> {first_req_pkt_ep, no_ctx_sched_ep, choose_grants, update_prios, gen_grant, reset_grant_state}
+    RECVD_REQUEST   -> {next_req_pkt_ep, sched_ep, choose_grants, update_prios, gen_grant, reset_grant_state};
+    RECVD_RESPONSE  -> {recv_resp_ep, sched_ep, choose_grants, update_prios, gen_grant, reset_grant_state};
+    RECVD_RESEND    -> {recv_resend_ep, tx_resend_resp};
+    RECVD_UNKNOWN   -> {recv_unkown_ep};
+    RECVD_GRANT     -> {recv_grant_ep};
+    RECVD_BUSY      -> {recv_busy_ep};
+    TIMEOUT_RESEND  -> {timeout_resend_ep, generate_resend_ep, reset_timeout_ep};
+}
+
+/************************* event processor definitions ****************************/
+
+list<instr_t> send_req_ep (SEND_REQUEST ev, sock_context sock_ctx, interm_out scratch){
+    list<instr> out;
+
+    if (sock_ctx.cur_rpcs.size() == MAX_OUTSTANDING_RPCS) {
+        // TODO: raise error
+        return;
+    }
+
+    uint64 rpc_id = sock_ctx.cur_rpcs.free_id();
+    uint16 init_seq = 0;
+    
+    flow_id_t fid(sock_ctx.local_ip, sock_ctx.local_port, rpc_id); 
+    instr_t instr = new_tx_ordered_data(ev.msg_len, fid, init_seq);
+    out.add(instr);
+
+    instr_t instr = add_tx_data_seg(id, init_seq, ev.addr, ev.msg_len);
+    out.add(instr);
+    
+    uint64 granted = HOMA_UNSCHED_BYTES;
+    if (ev.mesg_len < granted) granted = ev.msg_len;
+
+    uint64 birth = timestamp(ev);
+    instr = new_ctx_instr(homa_context,
+                          fid = fid,
+                          local_port = sock_ctx.local_port,
+                          remote_ip = ev.remote_ip,
+                          remote_port = ev.dest_port,
+                          id = rpc_id,
+                          seq = init_seq;
+                          last_seq = ceil(granted / HOMA_MSS),
+                          state = RPC_OUTGOING,
+                          message_length = ev.msg_len,
+                          curr_offset = granted,
+                          cc_granted = granted,
+                          birth = birth,
+                          rpc_is_client = true,
+                          // TODO: receiving = ?,
+                          // recv_count = ?);
+    out.add(instr);
+
+    bool single_packet = ev.msg_len <= HOMA_MSS;
+    uint8 prio;
+
+    if (single_packet){
+        prio = (HOMA_MAX_PRIORITY - 1) << 5;
+    }
+    else {
+        // TODO: set prio
+    }
+
+    
+    HomaBP bp;
+    bp.common.sport = sock_ctx.local_port;
+    bp.common.dport = ev.dest_port;
+    bp.common.doff = 40 >> 2;
+    bp.common.type = DATA;
+    bp.common.seq = init_seq;
+    bp.common.sender_id = rpc_id;
+
+    bp.data.message_length = ev.msg_len;
+    bp.data.incoming = ev.msg_len;
+    if (!single_packet) {
+        bp.data.incoming = granted;
+    }
+    bp.data.cutoff_version = 0;
+
+    bp.data.seg.offset = 0;
+
+    bp.data.seg.ack.rpcid = 0;
+    bp.data.seg.ack.sport = 0;
+    bp.data.seg.ack.dport = 0;
+
+    bp.priority = prio;
+    
+    addr_t addr = tx_buff(fid);
+    // and seg.offset, seg.segment_length
+    bp.data = unseg_data(addr, granted, HOMA_MSS, 
+                         [HomaBP::seq, init_seq, prev.common.seq + 1],
+                         [HomaBP::data.seg.offset, 0, prev.data.seg.offset + prev.payload_len],
+                         [HomaBP::data.seg.segment_length, payload_len]);
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    // set queue priority
+    // the scheduling policy should be setup once at the beginning
+
+    uint32 bytes_remaining = ev.message_length - granted;
+    instr = sched_instr(fid, 
+                        ((bytes_remaining, rpcid, sock_ctx.local_port), 
+                        birth));
+    out.add(instr);
+
+    return out;
+
+}
+
+list<instr_t> send_resp_ep (SEND_RESPONSE ev, homa_context ctx, interm_out int_out) {
+    list<instr> out;
+
+    uint16 init_seq = 0;
+    
+    instr_t instr = new_tx_ordered_data(ev.msg_len, ctx.fid, init_seq);
+    out.add(instr);
+
+    instr_t instr = add_tx_data_seg(ctx.fid, init_seq, ev.addr, ev.msg_len);
+    out.add(instr);
+    
+    uint64 granted = HOMA_UNSCHED_BYTES;
+    if (message_length < granted) granted = message_length;
+
+    uint64 birth = timestamp(ev);
+
+    ctx.seq = init_seq;
+    ctx.last_seq = ceil(granted / HOMA_MSS);
+    ctx.state = RPC_OUTGOING;
+    ctx.message_length = ev.msg_len;
+    ctx.curr_offset = granted;
+    ctx.cc_granted = granted;
+    ctx.birth = birth;
+
+    bool single_packet = ev.msg_len <= HOMA_MSS;
+    uint8 prio;
+
+    if (single_packet){
+        prio = (HOMA_MAX_PRIORITY - 1) << 5;
+    }
+    else {
+        // TODO: set prio
+    }
+
+    HomaBP bp;
+    bp.common.sport = ev.src_port;
+    bp.common.dport = ev.dest_port;
+    bp.common.doff = 40 >> 2;
+    bp.common.type = DATA;
+    bp.common.seq = init_seq;
+    bp.common.sender_id = ev.rpc_id;
+
+    bp.data.incoming = ev.msg_len;
+    if (!single_packet) {
+        bp.data.incoming = granted;
+    }
+    bp.data.cutoff_version = 0;
+
+    bp.data.seg.offset = 0;
+
+    bp.data.seg.ack.rpcid = 0;
+    bp.data.seg.ack.sport = 0;
+    bp.data.seg.ack.dport = 0;
+
+    bp.priority = prio;
+    
+    addr_t addr = tx_buff(fid);
+    // and seg.offset, seg.segment_length
+    bp.data = unseg_data(addr, granted, HOMA_MSS, 
+                         [HomaBP::seq, init_seq, prev.common.seq + 1],
+                         [HomaBP::data.seg.offset, 0, prev.data.seg.offset + prev.payload_len],
+                         [HomaBP::data.seg.segment_length, payload_len]);
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    // set queue priority (see pacing.h)
+    // the scheduling policy should be setup once at the beginning
+
+    uint32 bytes_remaining = ev.message_length - granted;
+    instr = sched_instr(fid, 
+                        ((bytes_remaining, rpcid, ctx.local_port), 
+                        birth));
+    out.add(instr);
+
+    return out;
+}
+
+list<instr_t> first_req_pkt_ep (RECVD_REQUEST ev, global_grant_context gctx, interm_out int_out) {
+    list<instr_r> out;
+
+
+    uint32 complete = 0;
+
+    flow_id_t fid(sock_ctx.local_ip, sock_ctx.local_port, rpc_id); 
+
+    uint8 state = RPC_INCOMING;
+    if (ev.single_packet) state = RPC_IN_SERVICE;
+
+    uint16 expected_segment_cnt = ceil(ev.message_length/HOMA_MSS);
+    sliding_wnd rcvd_seqs(0, expected_segment_cnt);
+    rcvd_seqs.set(ev.seq);
+
+    instr = new_ctx_instr(homa_context,
+                          fid = fid,
+                          local_port = ev.dport,
+                          remote_ip = ev.remote_ip,
+                          remote_port = ev.sport,
+                          id = rpc_id,
+                          seq = ev.seq;
+                          state = state,
+                          message_length = ev.message_length,
+                          expected_segment_cnt = expected_segment_cnt,
+                          rcvd_seqs = rcvd_seqs,
+                          cc_granted = 0,
+                          cc_incoming = ev.incoming,
+                          cc_bytes_remaining = (ev.message_length - ev.segment_length),
+                          rpc_is_client = false);
+
+    out.add(instr);
+
+
+    int_out.complete = ev.single_packet;
+    int_out.new_state = true;
+    int_out.needs_schedule = ev.message_length > ev.incoming;
+    int_out.last_bytes_remaining = (ev.message_length - ev.segment_length);
+    gctx.total_incoming += ev.incoming - ev.segment_length;
+
+    instr_t instr = new_rx_ordered_data(ev.msg_len, fid, 0);
+    out.add(instr);
+
+    instr = add_rx_data_seg(ev.hold_addr, ev.segment_length, 
+                                    fid, ev.offset);
+    out.add(instr);
+
+    if (int_out.complete) {
+        instr = flush_and_notify(fid, ev.message_length);
+        out.add(instr);
+    }
+
+    return out;
+}
+
+list<instr_t> next_req_pkt_ep (RECVD_REQUEST ev, homa_ctx ctx, 
+                               global_grant_context gctx, interm_out int_out) {
+    list<instr_t> out;
+
+    instr_t instr = add_rx_data_seg(ev.hold_addr, ev.segment_length, 
+                                    fid, ev.offset);
+    out.add(instr);
+    
+    // TODO: double check if this is the case
+    if (rcvd_seqs.is_set(ev.seq)){
+        int_out.dup_data_pkt = true;
+        return;
+    }
+
+    ctx.rcvd_seqs.set(ev.seq);
+    ctx.rcvd_seqs.slide();
+    bool complete = ctx.rcvd_seqs.head() == ctx.expected_segment_cnt;
+
+    if(complete) ctx.state = RPC_IN_SERVICE;
+
+    if(ev.incoming > ctx.cc_incoming)
+        ctx.cc_incoming = ev.incoming;
+
+    int_out.last_bytes_remaining = ctx.cc_bytes_remaining;
+    ctx.cc_bytes_remaining = ctx.cc_bytes_remaining - ev.segment_length;
+    gctx.total_incoming -= ev.segment_length;
+    
+    int_out.complete = complete;
+    int_out.new_state = false;
+    int_out.need_schedule = ev.message_length > ctx.cc_incoming;
+
+    if (int_out.complete) {
+        instr = flush_and_notify(fid, ev.message_length);
+        out.add(instr);
+    }
+
+    return out;
+}
+
+list<instr_t> recv_resp_ep (RECVD_RESPONSE ev, homa_context ctx, 
+                            global_grant_context gctx, interm_out int_out) {
+    list<instr_r> out;
+
+    bool new_state = ctx.state == ctx.RPC_OUTGOING;
+    int_out.new_state = new_state;
+    
+    // First packet
+    if(new_state) {
+        instr_t instr = new_rx_ordered_data(ev.msg_len, fid, 0);
+        out.add(instr);
+            
+        if(ev.single_packet) {
+            ctx.state = RPC_DEAD;
+            instr_t instr = add_rx_data_seg(ev.hold_addr, ev.segment_length, 
+                                            ctx.fid, ev.offset);
+            out.add(instr);
+
+            instr = flush_and_notify(fid, ev.message_length);
+            out.add(instr);
+
+            // TODO: cleanup state
+            int_out.complete = true;
+            return out;
+        }
+        ctx.state = ctx.RPC_INCOMING;
+
+        uint16 expected_segment_cnt = ceil(ev.message_length/HOMA_MSS);
+        sliding_wnd rcvd_seqs(0, expected_segment_cnt);
+        rcvd_seqs.set(ev.seq);
+        ctx.rcvd_seqs = rcvd_seqs;
+        ctx.expected_segment_cnt = expected_segment_cnt;
+
+        ctx.message_length = ev.message_length;
+        ctx.cc_incoming = ev.incoming;
+        
+        ctx.cc_bytes_remaining = ev.message_length - ev.segment_length;
+        int_out.last_bytes_remaining = ctx.cc_bytes_remaining;
+
+        gctx.total_incoming += ev.incoming - ev.segment_length;
+
+        instr_t instr = add_rx_data_seg(ev.hold_addr, ev.segment_length, 
+                                            ctx.fid, ev.offset);
+        out.add(instr);
+
+    } else {
+
+        if (rcvd_seqs.is_set(ev.seq)){
+            int_out.dup_data_pkt = true;
+            return out;
+        }
+
+        instr_t instr = add_rx_data_seg(ev.hold_addr, ev.segment_length, 
+                                            ctx.fid, ev.offset);
+        out.add(instr);
+        
+        ctx.rcvd_seqs.set(ev.seq);
+        ctx.rcvd_seqs.slide();
+        bool complete = ctx.rcvd_seqs.head() == ctx.expected_segment_cnt;
+
+        if(ev.incoming > ctx.cc_incoming)
+            ctx.cc_incoming = ev.incoming;
+
+        // I had last_bytes_remaining in req, do I need it here?
+        int_out.last_bytes_remaining = ctx.cc_bytes_remaining;
+        ctx.cc_bytes_remaining -= ev.segment_length;
+
+        
+        if(complete) {
+            intout_complete = true;
+            ctx.state = RPC_DEAD;
+
+            instr = flush_and_notify(fid, ev.message_length);
+            out.add(instr);
+            return out;
+        }
+
+        gctx.total_incoming -= ev.segment_length;
+    }
+
+    int_out.needs_schedule = ev.message_length > ctx.cc_incoming;
+    return out;
+}
+
+list<instr> no_ctx_sched_ep (RECV_REQUEST ev, global_grant_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if (int_out.complete) return;
+
+    if (!int_out.needs_schedule) return;
+
+    uint16 peer_id = ev.remote_ip & (MAX_PEER - 1);
+    rpc_info_1 elem;
+    elem.peer_id = peer_id;
+    elem.bytes_remaining = int_out.last_bytes_remaining;
+    elem.rpcid = ev.rpcid;
+    elem.local_port = ev.dport;
+    elem.remote_port = ev.sport;
+    elem.remote_ip = ev.remote_ip;
+    elem.incoming = ev_incoming;
+    elem.birth = int_out.rpc_birth;
+
+       
+    ctx.all_rpcs.add(elem);
+    int my_ind = ctx.all_rpcs.find_ge(elem);
+    elem = ctx.all_rpcs[ind];
+
+    rpc_info_1 search_elem = {0};
+    search_elem.peer_id = elem.peer_id;
+    
+    int highest_prio_ind = ctx.all_rpcs.find_ge(search_elem);
+    rpc_info_1 highest_prio = ctx.all_rpcs[highest_prio_ind];
+
+    if (highest_prio == elem) {
+        rpc_info_1 next_elem = elem;
+        next_elem.remote_ip += 1;
+        int old_ind = ctx.all_rpcs.find_ge(next_elem);
+        
+        if (old_ind < 0 || ctx.all_rpcs[old_ind].peer_id != elem.peer_id){
+            // This is the only rpc from this peer
+            if (int_out.new_state ||
+                !highest_prio.in_prio_list) {
+                
+                rpc_info_2 prio_elem;
+                prio_elem.bytes_remaining = elem.bytes_remaining;
+                prio_elem.peer_id = peer_id;
+                prio_elem.rpcid = ev.rpcid;
+                prio_elem.local_port = ev.dport;
+                prio_elem.remote_port = ev.sport;
+                prio_elem.remote_ip = ev.remote_ip;
+                prio_elem.message_length = ev.message_length;
+                prio_elem.incoming = ev_incoming;
+
+                int prio_ind = ctx.highest_prio_rpcs.add(prio_elem);
+                ctx.all_rpcs[my_ind].in_prio_list = true;
+                ctx.all_rpcs[my_ind].prio_list_ind = prio_ind;
+            }
+        }
+        else {
+
+            //remove previous highest priority
+            rpc_info_2 old_prio_elem;
+            rpc_info_1 old_elem = ctx.all_rpcs[old_ind];
+            old_prio_elem.bytes_remaining = old_elem.bytes_remaining;
+            old_prio_elem.peer_id = peer_id;
+            rpc_info_2 rmvd = ctx.highest_prio_rpcs.remove(old_prio_elem);
+            ctx.all_rpcs[old_ind].in_prio_list = false;
+            ctx.all_rpcs[old_ind].incoming = rmvd.incoming;
+
+            // add the new one
+            rpc_info_2 prio_elem;
+            prio_elem.bytes_remaining = elem.bytes_remaining;
+            prio_elem.peer_id = peer_id;
+            prio_elem.rpcid = ev.rpcid;
+            prio_elem.local_port = ev.dport;
+            prio_elem.remote_port = ev.sport;
+            prio_elem.remote_ip = ev.remote_ip;
+            prio_elem.message_length = ev.message_length;
+            prio_elem.incoming = ev_incoming;
+
+            int prio_ind = ctx.highest_prio_rpcs.add(prio_elem);
+            ctx.all_rpcs[my_ind].in_prio_list = true;
+            ctx.all_rpcs[my_ind].prio_list_ind = prio_ind;
+        }
+    }
+}
+
+// T can be RECVD_REQUEST or RECVD_RESPONSE
+list<instr> sched_ep<T> (T ev, homa_context hctx, global_grant_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if (int_out.complete) return;
+
+    if (!int_out.needs_schedule) return;
+
+    uint16 peer_id = ev.remote_ip & (MAX_PEER - 1);
+    rpc_info_1 elem;
+    elem.peer_id = peer_id;
+    elem.bytes_remaining = int_out.last_bytes_remaining;
+    elem.rpcid = ev.rpcid;
+    elem.local_port = ev.dport;
+    elem.remote_port = ev.sport;
+    elem.remote_ip = ev.remote_ip;
+    elem.incoming = hctx.cc_incoming;
+    elem.birth = hctx.birth;
+
+    if (int_out.new_state) {    
+        ctx.all_rpcs.add(elem);
+        // TODO: add message length and incoming
+    }
+    else {
+        int ind = ctx.all_rpcs.find_ge(elem);
+        if (ind < 0){
+            // we have already sent all grants
+            hctx.cc_incoming = hctx.message_length;
+            int_out.needs_schedule = false;
+            return;
+        }
+        ctx.all_rpcs[ind].bytes_remaining -= ev.segment_length;
+        if (ctx.all-rpcs[ind].in_prio_list){
+            int prio_ind = ctx.all_rpcs[ind].prio_list_ind;
+            ctx.highest_prio_rpcs[prio_ind].bytes_remaining -= ev_segment_length;
+        }
+        elem.bytes_remaining -= ev.segment_length;
+    }
+
+    int my_ind = ctx.all_rpcs.find_ge(elem);
+    elem = ctx.all_rpcs[ind];
+
+    rpc_info_1 search_elem = {0};
+    search_elem.peer_id = elem.peer_id;
+    
+    int highest_prio_ind = ctx.all_rpcs.find_ge(search_elem);
+    rpc_info_1 highest_prio = ctx.all_rpcs[highest_prio_ind];
+
+    if (highest_prio == elem) {
+        rpc_info_1 next_elem = elem;
+        next_elem.remote_ip += 1;
+        int old_ind = ctx.all_rpcs.find_ge(next_elem);
+        
+        if (old_ind < 0 || ctx.all_rpcs[old_ind].peer_id != elem.peer_id){
+            // This is the only rpc from this peer
+            if (int_out.new_state ||
+                !highest_prio.in_prio_list) {
+                
+                rpc_info_2 prio_elem;
+                prio_elem.bytes_remaining = elem.bytes_remaining;
+                prio_elem.peer_id = peer_id;
+                prio_elem.rpcid = ev.rpcid;
+                prio_elem.local_port = ev.dport;
+                prio_elem.remote_port = ev.sport;
+                prio_elem.remote_ip = ev.remote_ip;
+                prio_elem.message_length = ev.message_length;
+                prio_elem.incoming = elem.incoming;
+
+                int prio_ind = ctx.highest_prio_rpcs.add(prio_elem);
+                ctx.all_rpcs[my_ind].in_prio_list = true;
+                ctx.all_rpcs[my_ind].prio_list_ind = prio_ind;
+            }
+        }
+        else {
+
+            //remove previous highest priority
+            rpc_info_2 old_prio_elem;
+            rpc_info_1 old_elem = ctx.all_rpcs[old_ind];
+            old_prio_elem.bytes_remaining = old_elem.bytes_remaining;
+            old_prio_elem.peer_id = peer_id;
+            rpc_info_2 rmvd = ctx.highest_prio_rpcs.remove(old_prio_elem);
+            ctx.all_rpcs[old_ind].in_prio_list = false;
+            ctx.all_rpcs[old_ind].incoming = rmvd.incoming;
+
+            // add the new one
+            rpc_info_2 prio_elem;
+            prio_elem.bytes_remaining = elem.bytes_remaining;
+            prio_elem.peer_id = peer_id;
+            prio_elem.rpcid = ev.rpcid;
+            prio_elem.local_port = ev.dport;
+            prio_elem.remote_port = ev.sport;
+            prio_elem.remote_ip = ev.remote_ip;
+            prio_elem.message_length = ev.message_length;
+            prio_elem.incoming = elem.incoming;
+
+            int prio_ind = ctx.highest_prio_rpcs.add(prio_elem);
+            ctx.all_rpcs[my_ind].in_prio_list = true;
+            ctx.all_rpcs[my_ind].prio_list_ind = prio_ind;
+        }
+    }
+}
+
+// T can be RECVD_REQUEST or RECVD_RESPONSE
+void choose_grants<T> (T ev, global_grant_context ctx, interm_out int_out) {
+
+    //if (int_out.new_state) ctx.total_incoming = ctx.total_incoming + ev.incoming - ev.segment_length;
+    //else ctx.total_incoming = ctx.total_incoming - ev.segment_length;
+
+    if (finish_grant_choose) return;
+
+    uint16 next_peer_id = 0;
+    uint32 min_last_bytes_remaining = 0;
+    uint16 nr_rpc = 0;
+
+    rpc_info_2 elem;
+    elem.bytes_remaining = min_last_bytes_remaining;
+    elem.peer_id = 0;
+    for (int i = 0; i < 8; i++){
+        int ind = ctx.highest_prio_rpcs.find_ge(elem);
+        if (ind < 0) break;
+
+        rpc_info_2 grant_elem = ctx.highest_prio_rpcs[ind];
+        min_last_bytes_remaining = grant_elem.bytes_remaining;
+        next_peer_id = grant_elem.peer_id;
+
+        ctx.ri[i].peer_id = grant_elem.peer_id;
+        ctx.ri[i].rpcid = grant_elem.rpcid;
+        ctx.ri[i].local_port = grant_elem.local_port;
+        ctx.ri[i].remote_port = grant_elem.remote_port;
+        ctx.ri[i].remote_ip = grant_elem.remote_ip;         
+
+        uint32 new_grant = grant_elem.message_length - 
+                           grant_elem.bytes_remaining + HOMA_GRANT_WND;
+        if (new_grant > grant_elem.message_length){
+            new_grant = grant_elem.message_length;
+        }
+        
+        int available = HOMA_MAX_INCOMING - ctx.total_incoming;
+        uint32 increment = new_grant - grant_elem.incoming;
+
+        if (increment > 0 && available > 0){
+            if (increment > available){
+                increment = available;
+                new_grant = grant_elem.incoming + increment;
+            }
+
+            grant_elem.incoming = new_grant;
+            ctx.remove[i] = grant_elem.incoming >= grant_elem.message_length;
+            if (remove[i]){
+                //TODO: is this ok?
+                ctx.highest_prio_rpcs.remove(grant_elem);
+
+                rpc_info_1 rm_elem;
+                rm_elem.peer_id = grant_elem.peer_id;
+                rm_elem.bytes_remaining = grant_elem.bytes_remaining;
+                rm_elem.rpcid = grant_elem.rpcid;
+                rm_elem.local_port = grant_elem.local_port;
+                rm_elem.remote_port = grant_elem.remote_port;
+                rm_elem.remote_ip = grant_elem.remote_ip;
+    
+                ctx.all_rpcs.remove(rm_elem);
+            }
+            else {
+                ctx.highest_prio_rpcs[ind] = grant_elem;    
+            }
+            total_increment += increment;
+            ri[i].newgrant = new_grant;
+        }
+        nr_rpc += 1;
+
+        elem.peer_id = next_peer_id;
+        elem.bytes_remaining = min_last_bytes_remaining;
+    }
+    
+    ctx.total_incoming += total_increment;
+    ctx.grant_nonfifo_left -= total_increment;
+    if (ctx.grant_nonfifo_left <= 0){
+        ctx.grant_nonfifo_left += GRANT_NONFIFO;
+        ctx.need_grant_fifo = 1;
+    }
+
+    ctx.nr_grant_candidate = nr_rpc;
+
+    int actual_rpc = 0;
+    int priority = 0;
+    int prio_idx = 0;
+
+    for (int i = 0; i < nr_rpc; i+= 1){
+        if (ctx.ri[i].newgrant > 0){
+            actual_rpc += 1;
+            priority = HOMA_MAX_SCHED_PRIO - prio_idx;
+            prio_idx += 1;
+            if (priority < 0)
+                priority = 0;
+            ctx.ri[i].priority = priority;
+        }
+    }
+
+    ctx.nr_grant_ready = actual_rpc;
+
+    extra_levels = HOMA_MAX_SCHED_PRIO + 1 - actual_rpc;
+    if (extra_levels >= 0){
+        for (int i = 0; i < nr_rpc; i += 1){
+            if (ctx.ri[i].newgrant > 0){
+                priority = ctx.ri[i].priority;
+                priority -= extra_levels;
+                if (priority)
+                    ctx.ri[i].priority = priority;
+            }
+        }
+    }
+}
+
+// T can be RECVD_REQUEST or RECVD_RESPONSE
+void update_prios<T> (T ev, global_grant_context ctx, interm_out int_out) {
+    if (ctx.finish_grant_choose) return;
+
+    for (int i = 0; i < ctx.nr_grant_candidate; i++){
+        if (ctx.remove[i]){
+            // TODO: replace with a check on length
+            uint32 peer_id = ctx.ri[i].peer_id;
+            rpc_info_1 elem = {0};
+            elem.peer_id = peer_id;
+            int ind = ctx.all_rpcs.find_ge(elem);
+
+            if (ind >= 0 && ctx.all_rpcs[ind].peer_id == elem.peer_id){
+                // There is another element, which is the 
+                // highest priority  
+                elem = ctx.all_rpcs[ind];
+                rpc_info_2 prio_elem;
+                prio_elem.bytes_remaining = elem.bytes_remaining;
+                prio_elem.peer_id = peer_id;
+                prio_elem.rpcid = elem.rpcid;
+                prio_elem.local_port = elem.local_port;
+                prio_elem.remote_port = elem.remote_port;
+                prio_elem.remote_ip = elem.remote_ip;
+                prio_elem.message_length = elem.message_length;
+                prio_elem.incoming = elem.incoming;
+
+                ind prio_ind = ctx.highest_prio_rpcs.add(prio_elem);
+                ctx.all_rpcs[ind].in_prio_list = true;
+                ctx.all_rpcs[ind].prio_list_ind = prio_ind;
+            }
+        }
+
+    }
+
+    if (ctx.nr_grant_candidate) {
+        ctx.finish_grant_choose = true;
+    }
+}
+
+// T can be RECVD_REQUEST or RECVD_RESPONSE
+list<instr_t> gen_grants<T> (T ev, global_grant_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if (!ctx.finish_grant_choose) return out;
+
+    int_out.last_grant = false;
+    bool no_work = false;
+    int_out.send_fifo_rpc = false;
+    grant_info gi;
+    uint gi_idx;
+
+    ctx.granting_idx += 1;
+
+    if (ctx.nr_grant_ready == 0 && !ctx.need_grant_fifo){
+        int_out.last_grant = true;
+        no_work = true;
+        return out;
+    }
+
+    uint16 cnt = HOMA_OVERCOMMITMENT; 
+    if (ctx.nr_grant_candidate < cnt){
+        cnt = ctx.nr_grant_candidate;
+    }
+
+    if (ctx.need_grant_fifo){
+        // If we have RPC in the FIFO queue, we should grant it at last
+        if (ctx.granting_idx == cnt + 1){
+            int_out.last_grant = true;
+        }
+    }
+    else if (ctx.granting_idx == cnt) int_out.last_grant = true;
+    
+
+    if (ctx.need_grant_fifo && int_out.last_grant){
+        // it's time to grant the RPC in the FIFO queue
+        // TODO: fix this?
+        ind min_ind = min(ctx.all_rpcs, rpc_info_1::birth);
+        if (min_ind < 0){
+            no_work = true;
+            ctx.need_grant_fifo = 0; // error or no fifo rpc to grant
+            return out;
+        }
+        else {
+            uint64 increment = 0;
+            uint64 newgrant = 0;
+            bool need_remove = false;
+            rpc_info min_elem = ctx.all_rpcs[min_ind];
+
+            increment = GRANT_FIFO_INCREMENT;
+            // is this supposed to get updated in the
+            // other tree too?
+            newgrant = increment + min_ind.incoming;
+            ctx.all_rpcs[min_ind].incoming = newgrant;
+
+            if (newgrant > min_elem.message_length){
+                increment -= newgrant - min_elem.message_length;
+                ctx.all_rpcs[min_ind].incoming = min_elem.message_length;
+                need_remove = true;    
+            }
+
+            ctx.total_incoming += increment;
+
+            gi.rpcid = min_elem.rpcid;
+            gi.sport = min_elem.local_port;
+            gi.dport = min_elem.remote_port;
+            gi.remote_ip = min_elem.remote_ip;
+            gi.newgrant = ctx.all_rpcs[min_ind].incoming;
+            gi.priority = HOMA_MAX_SCHED_PRIO;
+
+            if (need_remove){
+                ctx.all_rpcs.remove(min_elem);
+            }
+            int_out.send_fifo_rpc = true;
+        }
+        
+    }
+    else {
+        // grant the RPC in the Priority queue
+        gi_idx = (ctx.granting_idx - 1);
+        gi_idx = gi_idx % HOMA_OVERCOMMITMENT;
+
+        gi.sport = ctx.ri[gi_idx].local_port;
+        gi.dport = ctx.ri[gi_idx].remote_port;
+        gi.rpcid = ctx.ri[gi_idx].rpcid;
+        gi.newgrant = ctx.ri[gi_idx].newgrant;
+        gi.remote_ip = ctx.ri[gi_idx].remote_ip;
+        gi.priority = ctx.ri[gi_idx].priority;
+
+        ctx.ri[gi_idx].newgrant = 0;
+    }
+
+    HOMABP bp;
+    bp.common.type = GRANT;
+    bp.common.dport = gi.dport;
+    bp.common.sport = gi.sport;
+    bp.common.sender_id = gi.rpcid;
+    bp.grant.offset = gi.newgrant;
+    bp.grant.priority = gi.priority;
+    bp.grant.resend_all = 0;
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, gi.remote_ip, bp);
+    out.add(bp);
+
+    return out;
+}
+
+// T can be RECVD_REQUEST or RECVD_RESPONSE
+list<instr_t> reset_grant_state<T> (T ev, global_grant_context ctx, interm_out int_out) {
+    if (!ctx.finish_grant_choose) return out;
+
+    if (int_out.last_grant){
+        ctx.granting_idx = 0;
+        ctx.nr_grant_candidate = 0;
+        ctx.finish_grant_choose = 0;
+    }
+
+    // flush the FIFO queue
+    if (int_out.send_fifo_rpc)
+        ctx.need_grant_fifo = 0;
+
+    return;
+}
+
+
+list<instr_t> recv_grant_ep (RECVD_GRANT ev, homa_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if (ctx.state != RPC_OUTGOING)
+        return out;
+
+    ctx.cc_sched_prio = ev.priority;
+
+    if (ctx->cc.granted < ev.offset){
+        uint32 new_bytes = ev.offset - ctx.cc_granted;
+
+        ctx.cc_granted = ev.offset;
+        HomaBP bp;
+
+        bp.common.sport = ctx.local_port;
+        bp.common.dport = ctx.remote_port;
+        bp.common.doff = 40 >> 2;
+        bp.common.type = DATA;
+        bp.common.seq = ctx.last_seq;
+        bp.common.sender_id = ctx.rpcid;
+
+        bp.data.incoming = ctx.cc_granted;
+        bp.data.cutoff_version = 0;
+
+        bp.data.seg.ack.rpcid = 0;
+        bp.data.seg.ack.sport = 0;
+        bp.data.seg.ack.dport = 0;
+
+        bp.priority = ctx.cc_sched_prio;
+
+        
+        addr_t addr = tx_buff(fid);
+        // and seg.offset, seg.segment_length
+        bp.data = unseg_data(addr, granted, HOMA_MSS, 
+                            [HomaBP::seq, bp.common.seq, prev.common.seq + 1],
+                            [HomaBP::data.seg.offset, ctx.curr_offset, prev.data.seg.offset + prev.payload_len],
+                            [HomaBP::data.seg.segment_length, payload_len],
+                            prio);
+
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+
+        // set queue priority (see pacing.h)
+        // the scheduling policy should be setup once at the beginning
+        uint32 bytes_remaining = ctx.message_length - ctx.curr_offset;
+        instr = sched_instr(ctx.fid, 
+                            ((bytes_remaining, ctx.rpcid, ctx.local_port), ctx.birth));
+        out.add(instr);
+
+        ctx.last_seq += ceil(new_bytes / HOMA_MSS);
+        ctx.curr_offset += new_bytes;        
+    }
+
+    return out;
+}
+
+list<instr_t> recv_resend_ep (RECVD_RESEND ev, homa_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    int_out.type_pkt = RESEND;
+
+    bool need_kick = false;
+
+    if(ctx.state == ctx.RPC_DEAD) {
+        int_out.type_pkt = UNKNOWN;
+        return out;
+    }
+
+    if(!ctx.rpc_is_client && ctx.state != ctx.RPC_OUTGOING) {
+        if(ctx.message_length - ctx.cc_bytes_remaining > (ctx.cc_incoming/ctx.HOMA_MSS) * ctx.HOMA_MSS || 
+            ((ctx.message_length - ctx.cc_bytes_remaining == (ctx.cc_incoming/ctx.HOMA_MSS) * ctx.HOMA_MSS) && 
+            ctx.cc_incoming != ctx.message_length)) {
+
+            int_out.type_pkt = BUSY;
+
+        } else {
+            int_out.type_pkt = 0;
+        }
+
+    } else if(ev.offset >= ctx.curr_offset) {
+        int_out.type_pkt = BUSY;
+
+    } else if(ev.length == 0){
+        int_out.type_pkt = BUSY;
+    }
+
+    if(int_out.type_pkt == RESEND) {
+
+        HOMABP bp;
+        bp.common.sport = ev.dport;
+        bp.common.dport = ev.sport;
+        bp.common.doff = 40 >> 2;
+        bp.common.type = DATA;
+        bp.common.seq = ev.seq;
+        bp.common.sender_id = ctx.id;
+
+        bp.data.incoming = ctx.cc_granted;
+        bp.data.cutoff_version = 0;
+        bp.data.seg.offset = ev.offset;
+        bp.data.retransmit = 1;
+
+        bp.priority = ev.prio << 5;
+        
+        addr_t addr = tx_buff(fid);
+
+        bp.data = unseg_data(addr, ev.length, HOMA_MSS, 
+                            [HomaBP::seq, ev.seq, prev.common.seq + 1],
+                            [HomaBP::data.seg.offset, ev.offset, prev.data.seg.offset + prev.payload_len],
+                            [HomaBP::data.seg.segment_length, payload_len]);
+
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+
+        ctx.resend_count += 1;
+    }
+
+    return out;
+}
+
+list<instr_t> tx_resend_resp (RECVD_RESEND ev, homa_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if(int_out.type_pkt != ctx.UNKNOWN && int_out.type_pkt != ctx.BUSY)
+        return out;
+
+    HOMABP bp;
+    bp.common.type = int_out.type_pkt;
+    bp.common.sender_id = ctx.id;
+    bp.common.sport = ev.dport;
+    bp.common.dport = ev.sport;
+    bp.common.doff = 40 >> 2;
+    bp.common.seq = ev.seq;
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+    return out;
+}
+
+
+list<instr_t> recv_unkown_ep (RECVD_UNKNOWN ev, homa_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if(ctx.state == RPC_DEAD) {
+        return;
+    }
+    if(ctx.rpc_is_client) {
+        if(ctx.state == RPC_OUTGOING) {
+            HOMABP bp;
+            bp.common.sport = ev.dport;
+            bp.common.dport = ev.sport;
+            bp.common.doff = 40 >> 2;
+            bp.common.type = DATA;
+            bp.common.seq = 0;
+            bp.common.sender_id = ctx.id;
+
+            bp.data.incoming = ctx.cc_granted;
+            bp.data.cutoff_version = 0;
+            bp.data.seg.offset = 0;
+            bp.data.retransmit = 1;
+
+            bp.priority = ev.prio << 5;
+            
+            addr_t addr = tx_buff(fid);
+            
+            bp.data = unseg_data(addr, ctx.curr_offset, ctx.HOMA_MSS, 
+                                [HomaBP::seq, 0, prev.common.seq + 1],
+                                [HomaBP::data.seg.offset, 0, prev.data.seg.offset + prev.payload_len],
+                                [HomaBP::data.seg.segment_length, payload_len]);
+
+            instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+            out.add(instr);
+        }
+    } else {
+        ctx.state = RPC_DEAD;
+        instr_t instr = destroy_ctx_instr(ctx, ctx.fid);
+        out.add(instr);
+    }
+
+    return out;
+}
+
+void recv_busy_ep (RECVD_BUSY ev, homa_context ctx, interm_out int_out) {
+
+    if(ctx.state == RPC_DEAD)
+        return;
+
+    ctx.busy_count++;
+}
+
+list<instr_t> timeout_resend_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out) {
+    list<instr_t> out;
+
+    if(ctx.last_busy_count != ctx.busy_count) {
+        ctx.silent_ticks = 0;
+        ctx.last_busy_count = ctx.busy_count;
+    } else {
+        ctx.silent_ticks += 1;
+    }
+
+    // If it reaches 10 resends, it will abort the RPC
+    if(ctx.resend_try == ABORT_RESEND) {
+        // Question: similar to the other question, is there a way to "destroy"
+        // the context and other things?
+        instr_t instr = timer_cancel_instr(timeout_res);
+        out.add(instr);
+        int_out.skip_timer_ep = true;
+        return out;
+    }
+
+    // Transmitting data
+    if(ctx.state == RPC_OUTGOING && ctx.curr_offset < ctx.message_length) {
+        uint32 minimum_tx = ctx.message_length - ctx.curr_offset;
+        if(minimum_tx > ctx.HOMA_MSS)
+            minimum_tx = ctx.HOMA_MSS;
+        if(ctx.curr_offset + minimum_tx <= ctx.cc_granted) {
+            ctx.silent_ticks = 0;
+            ctx.resend_try = 0;
+            int_out.skip_timer_ep = true;
+            return out;
+        }
+    }
+
+    // Receiving data
+    if(ctx.state == RPC_INCOMING) {
+        if (ctx.message_length - ctx.cc_bytes_remaining > (ctx.cc_incoming/ ctx.HOMA_MSS) * ctx.HOMA_MSS ||
+            ((ctx.message_length - ctx.cc_bytes_remaining == (ctx.cc_incoming/ ctx.HOMA_MSS) * ctx.HOMA_MSS) && 
+                ctx.cc_incoming != ctx.message_length)) {
+
+            ctx.silent_ticks = 0;
+            ctx.resend_try = 0;
+            int_out.skip_timer_ep = true;
+            return out;
+        }
+    } else if(!ctx.rpc_is_client) {
+        ctx.silent_ticks = 0;
+        ctx.resend_try = 0;
+        int_out.skip_timer_ep = true;
+        return out;
+    }
+
+    // Checks difference from last snapshot
+    if (ctx.cc_bytes_remaining != ctx.last_cc_bytes_remaining ||
+        ctx.cc_granted != ctx.last_cc_granted ||
+        ctx.cc_incoming != ctx.last_cc_incoming ||
+        ctx.resend_count != ctx.last_resend_count) {
+        ctx.silent_ticks = 0;
+        ctx.resend_try = 0;
+        ctx.last_cc_bytes_remaining = ctx.cc_bytes_remaining;
+        ctx.last_cc_granted = ctx.cc_granted;
+        ctx.last_cc_incoming = ctx.cc_incoming;
+        ctx.last_resend_count = ctx.resend_count;
+        int_out.skip_timer_ep = true;
+        return out;
+    }
+
+    if(ctx.silent_ticks < (RESEND_TICK - 1)) {
+        int_out.skip_timer_ep = true;
+        return out;
+    }
+
+    ctx.resend_try += 1;
+
+    return out;
+}
+
+list<instr_t> generate_resend_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out) {
+
+    list<instr_t> out;
+
+    if(int_out.skip_timer_ep) {
+        return out;
+    }
+
+    HOMABP bp;
+    if(ctx.state == RPC_OUTGOING) {
+        bp.resend.offset = 0;
+        bp.resend.length = 100;
+        bp.resend.priority = HOMA_MAX_PRIORITIES - 1;
+
+    } else {
+        // Question: is this okay?
+
+        uint16 start_hole = ctx.rcvd_seqs.first_unset();
+
+        sliding_wnd temp = ctx.rcvd_seqs;
+        temp.slide(start_hole);
+
+        uint16 end_hole = ctx.temp.first_set();
+
+        bp.resend.offset = start_hole * ctx.HOMA_MSS;
+        bp.resend.length = (end_hole - start_hole + 1) * ctx.HOMA_MSS;
+        bp.resend.priority = HOMA_MAX_PRIORITIES - 1;
+    }
+
+    bp.common.type = RESEND;
+    bp.common.sender_id = ctx.id;
+    bp.common.sport = ctx.local_port;
+    bp.common.dport = ctx.remote_port;
+
+    bp.priority = (HOMA_MAX_PRIORITY - 1) << 5;
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    return out;
+}
+
+list<instr_t> reset_timeout_ep(TIMEOUT_RESEND ev, homa_context ctx, interm_out int_out) {
+
+    uint32 CC_INTERVAL_US = 200;
+    uint32 t = get_curr_ts() - timestamp(ev);
+    uint64 sleep_time = 0;
+    if(t < CC_INTERVAL_US)
+        sleep_time = (sleep_time - t) * 1000;
+    TIMEOUT_RESEND new_ev;
+    instr_t instr = timer_restart_instr(timeout_res, nanoseconds(sleep_time), new_ev);
+    out.add(instr);
+
+    return out;
+}

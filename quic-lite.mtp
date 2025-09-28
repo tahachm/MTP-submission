@@ -1,0 +1,843 @@
+/**************  event declarations ***************/
+
+event qlite_send : APP_EVENT {
+    uint62 stream_id;
+    uint32 data_size;
+    addr_t addr;
+}
+
+event qlite_recv: APP_EVENT {
+    uint62 stream_id;
+    uint32 data_size;
+    addr_t user_buf_addr;
+}
+
+event qlite_ack : NET_EVENT {
+    uint62 stream_id;
+    uint32 largest_acked;
+    uint32 max_stream_data;
+}
+
+event qlite_data : NET_EVENT {
+    uint62 stream_id;
+    uint32 offset;
+    uint32 len;
+    addr_t hold_addr;
+}
+
+event qlite_timeout: TIMER_EVENT {};
+
+
+/**************  TCP packet blueprint  ***************/
+
+pkt_bp StreamFrameBP{
+    int32 frameType;
+    int32 data_length;
+    int62 stream_id;
+    int32 offset;
+    data_t data;
+}
+
+pkt_bp ACKFrameBP{
+    int32 frameType;
+    int32 largest_acked;
+    uint32 max_stream_data;
+    uint62 stream_id;
+}
+
+pkt_bp UDPBP{
+    int16 source;
+    int16 dest;
+    int16 len;
+    int16 checksum;
+}
+pkt_pb QLiteBP{
+    UDPBP udp;
+    bool header_form;
+    uint7 flags;
+    // todo: destionation id
+    int32 pkt_id;
+    data_t frames = bp_list({StreamFrameBP,ACKFrameBP});
+}
+
+
+/****************** contexts and other structs **************/
+
+struct mtp_ctx_stream {
+    uint32 largest_ack;
+
+    uint32 last_max_data;
+
+    uint32 unacked_offset;
+    uint32 next_offset;
+
+    uint32 flightsize_dupl;
+    uint32 dup_acks;
+
+    // receiver vars 
+    uint32 max_recv_offset;
+    uint32 recv_next;
+    uint32 last_flushed;
+    bool adv_zero_wnd;
+
+    sliding_wnd meta_rwnd;
+    bool first_send_req;
+    bool first_data_rcvd;
+};
+
+context qlite_context {
+    uint32 remote_ip;
+    uint32 local_ip;
+    uint16 remote_port;
+    uint16 local_port;
+    
+    uint8_t state;
+    uint32_t MSS;
+
+    struct mtp_ctx_stream s0;
+    struct mtp_ctx_stream s1;
+
+    // congestion control vars, using TCP CC
+    uint32_t ssthresh;
+    uint32_t cwnd_size;
+
+    timer_t qlite_timeout;
+
+    uint32 num_rtx;
+    uint32 max_num_rtx;
+}
+
+interm_output interm_out {
+    bool change_cwnd;
+    bool skip_ack_eps;
+}
+
+/****************** extracting events out of packets ********************/
+net_to_transp ntt_module {
+    net_header IPheader {
+        uint4 hdr_len;
+        uint16 tot_len;
+        uint16 identification;
+        uint3 flags;
+        uint8 ttl;
+        uint8 protocol;
+        uint16 hdrChecksum;
+        uint32 src_ip;
+        uint32 dst_ip;
+    }
+
+    list<event_t> parse_net_packet(pkt_t p, IPheader i) { 
+        list<event_t> out;
+        QLiteBP pkt_bp;
+        p.extract(pkt_bp);
+
+        flow_id id(i.src_ip, i.dst_ip, p.src_port, p.dst_port);
+        
+        for (int i = 0; i < pkt_bp.frames.size(); i++){
+            if (type(pkt_bp.frames[i]) == StreamFrameBP){
+                StreamFrameBP fbp = pkt_bp.frames[i];
+                qlite_data ev;
+                ev.stream_id = fbp.stream_id;
+                ev.offset = fbp.offset;
+                ev.hold_addr = fbp.data.addr;
+                ev.len = fbp.data_length;
+                set_flow_id(ev, id);
+                out.add(ev);    
+            }
+            else if (type(pkt_bp.frames[i]) == ACKFrameBP){
+                ACKFrameBP fbp = pkt_bp.frames[i];
+                qlite_ack ev;
+                ev.stream_id = fbp.stream_id;
+                ev.largest_ack = fbp.largest_ack;
+                ev.max_stream_data = fbp.max_stream_data;
+                set_flow_id(ev, id);
+                out.add(ev);
+            }
+        }
+            
+        return out;
+    }
+}
+
+/************************ event processor declarations **************************/
+list<instr_t> send_ep (SEND ev, tcp_context ctx, interm_out scratch);
+list<instr_t> flush_ep (RECV ev, tcp_context ctx, interm_out scratch);
+
+void timestamp_ep(ACK ev, tcp_context ctx, interm_out scratch);
+void rto_ep (ACK ev, tcp_context ctx, interm_out scratch);
+void cwnd_ep (ACK ev, tcp_context ctx, interm_out scratch);
+list<instr_t> ack_net_ep (ACK ev, tcp_context ctx, interm_out scratch);
+
+
+list<instr_t> data_net_ep (DATA ev, tcp_context ctx, interm_out scratch);
+list<instr_t> send_ack (DATA ev, tcp_context ctx, interm_out scratch);
+
+
+/*************************** dispatcher ************************/
+dispatch disp_table {
+    qlite_send            -> {send_ep};
+    qlite_recv            -> {flush_ep};
+    qlite_ack             -> {timestamp_ep, rto_ep, cwnd_ep, ack_net_ep};
+    qlite_data            -> {data_net_ep, send_ack};
+    qlite_timeout         -> {timeout_ep}
+}
+
+/************************* event processor definitions ****************************/
+
+list<instr_t> send_ep (qlite_send ev, qlite_context ctx, interm_out scratch) {
+    
+    uint62 stream_id = ev.stream_id;
+    mtp_ctx_stream sctx = stream_id == 0 ? ctx.s0 : ctx.s1;
+    id send_buf_id = id(get_flow_id(ev), stream_id);
+
+    if (sctx.first_send_req){
+        instr_t instr = new_tx_ordered_data(INF, send_buf_id);
+        sctx.first_send_req = false;
+        out.add(instr);
+    }
+
+    sctx.data_end = sctx.data_end + ev.size;
+    instr_t instr = add_tx_data_seg(send_buf_id, ev.addr, ev.data_size);
+    out.add(instr);
+
+	// Calculate how much can we send from stream 0
+	int data_rest0 = ctx.s0.data_end - ctx.s0.next_offset;
+	int in_flight0 = ctx.s0.next_offset - ctx.s0.unacked_offset;
+	int max_stream_data = ctx.s0.last_max_data;
+	int bytes_to_send0 = MIN(data_rest0, max_stream_data - ctx.s0.next_offset);
+	if (bytes_to_send0 < 0) bytes_to_send0 = 0;
+
+	// Calculate how much can we send from stream 1
+	int data_rest1 = ctx.s1.data_end - ctx.s1.next_offset;
+	int in_flight1 = ctx.s1.next_offset - ctx.s1.unacked_offset;
+	max_stream_data = ctx.s1.last_max_data;
+	int bytes_to_send1 = MIN(data_rest1, max_stream_data - ctx.s1.next_offset);
+	if (bytes_to_send1 < 0) bytes_to_send1 = 0;
+
+	// Calculate total to send
+	int remaining_in_cwnd = ctx.cwnd_size - (in_flight0 + in_flight1);
+	int total_bytes_to_send = MIN(bytes_to_send0 + bytes_to_send1, 
+							remaining_in_cwnd);
+	if (total_bytes_to_send <= 0) {
+        return out;
+	}
+
+	// Decide which stream should go first
+	uint32 sent_from_s0 = ctx.s0.next_offset;
+	uint32 sent_from_s1 = ctx.s1.next_offset;
+
+	uint62 first_stream = 0;
+	mtp_ctx_stream first_stream_ctx = ctx.s0;
+	int first_bytes_to_send = bytes_to_send0;
+
+	uint62 next_stream = 1;
+	mtp_ctx_stream next_stream_ctx = ctx.s1;
+	int next_bytes_to_send = bytes_to_send1;
+
+	bool cond1 = sent_from_s0 > sent_from_s1 && sent_from_s0 > sent_from_s1 + QUIC_SCHED_CHUNK; //100KB
+	bool cond2 = sent_from_s0 < sent_from_s1 && sent_from_s1 < sent_from_s0 + QUIC_SCHED_CHUNK; // 100KB
+	bool cond3 = bytes_to_send0 <= 0;
+
+	if (cond1 || cond2 || cond3){
+		first_stream = 1;
+		first_stream_ctx = ctx.s1;
+		first_bytes_to_send = bytes_to_send1;
+
+		next_stream = 0;
+		next_stream_ctx = ctx.s0;
+		next_bytes_to_send = bytes_to_send0;
+	}
+
+	int bytes_from_first = MIN(first_bytes_to_send, remaining_in_cwnd);
+	int bytes_from_next = 0;
+	if (bytes_from_first < remaining_in_cwnd){
+		bytes_from_next = MIN(next_bytes_to_send, (remaining_in_cwnd - bytes_from_first));
+	}
+
+	// Generating from first
+	{
+        StreamFrameBP fbp;
+        fbp.stream_id = first_stream;
+        ACKFrameBP abp;
+        abp.stream_id = first_stream;
+        QLiteBP bp;
+
+        bp.udp.source = ctx.local_port;
+        bp.udp.dest = ctx.remote_port;
+
+        fbp.offset = first_stream_ctx.next_offset;        
+
+        abp.largest_ack = first_stream_ctx.recv_next;
+        abp.max_stream_data = first_stream_ctx.max_recv_offset;
+		if (max_stream_data == first_stream_ctx.recv_next) first_stream_ctx.adv_zero_wnd = TRUE;
+
+        id_t buf_id = id(get_flow_id(ev), first_stream)
+        fbp.data = bp.data = unseg_data(buf_id, first_stream_ctx.next_offset, bytes_from_first, SMSS, 
+                                [StreamFrameBP::offset, first_stream_ctx.next_offset, prev.hdr.offset + prev.payload_len]);
+
+
+        bp.frames.add(fbp);
+        bp.frames.add(abp);
+
+		first_stream_ctx.next_offset += bytes_from_first;
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+	}
+    
+	
+	// Generating from next
+	if (bytes_from_next > 0){
+		StreamFrameBP fbp;
+        fbp.stream_id = next_stream;
+        ACKFrameBP abp;
+        abp.stream_id = next_stream;
+        QLiteBP bp;
+
+        bp.udp.source = ctx.local_port;
+        bp.udp.dest = ctx.remote_port;
+
+        fbp.offset = next_stream_ctx.next_offset;        
+
+        abp.largest_ack = next_stream_ctx.recv_next;
+        abp.max_stream_data = next_stream_ctx.max_recv_offset;
+		if (max_recv_offset == next_stream_ctx.recv_next) next_stream_ctx.adv_zero_wnd = true;
+
+        id_t buf_id = id(get_flow_id(ev), next_stream)
+        fbp.data = bp.data = unseg_data(buf_id, next_stream_ctx.next_offset, bytes_from_next, SMSS, 
+                                [StreamFrameBP::offset, next_stream_ctx.next_offset, prev.hdr.offset + prev.payload_len]);
+
+
+		next_stream_ctx.next_offset += bytes_from_next;
+
+        bp.frames.add(fbp);
+        bp.frames.add(abp);
+        
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+	}
+
+    instr_t instr = timer_start_instr(timeout, nanoseconds(ctx.RTO)); 
+    out.add(instr); 
+
+    return out;
+}
+
+
+void timestamp_ep(qlite_ack ev, qlite_context ctx, interm_out scratch)
+{
+	if (valid_opt(ev.ts)) {
+		ctx.ts_recent = ev.ts.value1;
+		ctx.ts_lastack_rcvd = ev.ts.value2;
+		ctx.ts_last_ts_upd = now();
+	}
+}
+
+
+void rto_ep (qlite_ack ev, qlite_context ctx, interm_out scratch) {
+    
+    if (ctx.state != 5) return;
+
+    sctx = ev.stream_id == 0 ? ctx.s0 : ctx.s1;
+
+    if(ev.largest_acked < sctx.unacked_offset || ctx.next_offset < ev.largest_acked) {
+        scratch.skip_ack_eps = 1;
+        return;
+    }
+
+    uint32 granularity_g = 1;
+    uint32 RTT = 100000000;
+
+    if(ctx.first_rto) {
+        ctx.SRTT = RTT;
+        ctx.RTTVAR = RTT / 2;
+        if(granularity_g >= 4 * ctx.RTTVAR)
+            ctx.RTO = ctx.SRTT + granularity_g;
+        else
+            ctx.RTO = ctx.SRTT + 4 * ctx.RTTVAR;
+        
+        ctx.first_rto = false;
+    } else {
+        ctx.RTTVAR = (1 - 1/4) * ctx.RTTVAR + 1/4 * abs(ctx.SRTT - RTT);
+        ctx.SRTT = (1 - 1/8) * ctx.SRTT + 1/8 * RTT;
+        if(granularity_g >= 4 * ctx.RTTVAR)
+            ctx.RTO = ctx.SRTT + granularity_g;
+        else
+            ctx.RTO = ctx.SRTT + 4 * ctx.RTTVAR;
+    }
+}
+
+void cwnd_ep (qlite_ack ev, qlite_context ctx, interm_out scratch) {
+    if(scratch.skip_ack_eps)
+        return;
+    
+    if (ctx.state != 5) return;
+    
+    scratch.change_cwnd = 1;
+
+    if(ev.largest_ack == sctx.largest_ack) {
+        sctx.dup_acks += 1;
+        scratch.change_cwnd = 0;
+
+        if(sctx.dup_acks == 1) {
+            sctx.flightsize_dupl = sctx.next_offset - sctx.unacked_offset;
+        }
+
+        if(sctx.duplicate_acks == 3) {
+
+            uint32 opt1 = sctx.flightsize_dupl / 2;
+            uint32 opt2 = 2 * ctx.SMSS;
+            if(opt1 >= opt2)
+                ctx.ssthresh = opt1;
+            else
+                ctx.ssthresh = opt2;
+
+            ctx.cwnd_size = ctx.ssthresh + ctx.SMSS;
+        }
+        
+        if(sctx.duplicate_acks != 3) {
+            ctx.cwnd_size = ctx.cwnd_size + ctx.SMSS;
+        }
+
+    } else {
+        if(sctx.duplicate_acks >= 3) {
+            ctx.cwnd_size = ctx.ssthresh;
+        }
+
+        sctx.duplicate_acks = 0;
+        sctx.largest_ack = ev.ack_seq;
+    }
+
+    if(scratch.change_cwnd) {
+        // calculate how many packets have been acked
+        uint32 rmlen = ev.ack_seq - sctx.unacked_offset;
+        uint16 packets = rmlen / ctx.SMSS;
+        if (packets * ctx.SMSS > rmlen) {
+            packets = packets + 1;
+        }
+
+        if(ctx.cwnd_size < ctx.ssthresh) {
+            ctx.cwnd_size = ctx.cwnd_size + ctx.SMSS * packets;
+        }
+        else {
+            uint32 add_cwnd = packets * ctx.SMSS * ctx.SMSS / ctx.cwnd_size;
+            ctx.cwnd_size = ctx.cwnd_size + add_cwnd;
+        }
+    }
+}
+
+list<instr_t> ack_net_ep (qlite_ack ev, qlite_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    if(scratch.skip_ack_eps)
+        return out;
+
+    if (ctx.state != 5) return out; //ESTABLISHED_ST
+
+    mtp_ctx_stream sctx = ev.stream_id == 0 ? ctx.s0 : ctx.s1;
+
+    // Update window, and allow user to start writing 
+    // if peer just has space to receive packets
+    uint32 roffset = sctx.last_max_data;
+    // MTP TODO: sequence type
+    if (ev.max_stream_data > roffset){
+        sctx.last_max_data = ev.max_stream_data;
+        if (sctx.next_offset == ev.max_stream_data){
+            // TODO: fill out
+            instr_t instr = notify_instr();
+            out.add(instr);        
+        }
+    }
+    
+    // Calculate how much can we send from stream 0
+	int data_rest0 = ctx.s0.data_end - ctx.s0.next_offset;
+	int in_flight0 = ctx.s0.next_offset - ctx.s0.unacked_offset;
+	int max_stream_data = ctx.s0.last_max_data;
+	int bytes_to_send0 = MIN(data_rest0, max_stream_data - ctx.s0.next_offset);
+	if (bytes_to_send0 < 0) bytes_to_send0 = 0;
+
+	// Calculate how much can we send from stream 1
+	int data_rest1 = ctx.s1.data_end - ctx.s1.next_offset;
+	int in_flight1 = ctx.s1.next_offset - ctx.s1.unacked_offset;
+	max_stream_data = ctx.s1.last_max_data;
+	int bytes_to_send1 = MIN(data_rest1, max_stream_data - ctx.s1.next_offset);
+	if (bytes_to_send1 < 0) bytes_to_send1 = 0;
+
+	// Calculate total to send
+	int remaining_in_cwnd = ctx.cwnd_size - (in_flight0 + in_flight1);
+	int total_bytes_to_send = MIN(bytes_to_send0 + bytes_to_send1, 
+							remaining_in_cwnd);
+
+    mtp_ctx_stream sctx = ev.stream_id == 0 ? ctx.s0 : ctx.s1;
+	
+	if ((ev.stream_id == 0 && data_rest0 == 0 && ev.largest_ack == sctx->next_offset)){
+		if (ctx->state != CLOSING) {
+			uint32 rmlen = ev.largest_ack - sctx.unacked_offset;
+			
+			if(rmlen > 0) {
+                id_t send_buf_id = id(get_flow_id(ev), ev.stream_id);
+				instr_t instr = tx_flush_and_notify(send_buf_id, offset, rmlen);
+				sctx->unacked_offset = ev.largest_ack;
+				ctx->num_rtx = 0;
+			}
+		}	
+		return out;
+	}
+
+	if ((ev.stream_id == 1 && data_rest1 == 0 && ev.largest_ack == sctx.next_offset)) {
+		if (ctx->state != CLOSING) {
+			uint32 rmlen = ev.largest_ack - sctx.unacked_offset;
+			
+			if(rmlen > 0) {
+                id_t send_buf_id = id(get_flow_id(ev), ev.stream_id);
+				instr_t instr = tx_flush_and_notify(send_buf_id, offset, rmlen);
+				sctx->unacked_offset = ev.largest_ack;
+				ctx->num_rtx = 0;
+			}
+		}	
+		else if (ev.stream_id == 1){
+            // TODO: close
+        }
+
+        return out;
+	}
+
+	uint32_t effective_window = ctx->cwnd_size;
+    if ((sctx.last_max_data - sctx.next_offset) < effective_window){
+        effective_window = (sctx.last_max_data - sctx.next_offset);
+    }
+	
+    if(sctx.duplicate_acks == 3) {
+        bytes_to_send = ctx.SMSS;
+        if(bytes_to_send > effective_window)
+            bytes_to_send = effective_window;
+
+        QLiteBP bp;
+        bp.src_port = ctx.local_port;
+        bp.dest_port = ctx.remote_port;
+        StreamFrameBP fbp;
+        fbp.offset = sctx.unacked_offset;
+        id_t send_buf_id = id(get_flow_id(ev), ev.stream_id);
+        fbp.data = seg_data(send_buf_id, sctx.unacked_offset, bytes_to_send);
+        ACKFrameBP abp;
+        abp.largest_ack = sctx.recv_next;
+
+        bp.frames.add(fbp);
+        bp.frames.add(abp);
+
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+
+        return out;
+    }
+
+    uint32 rmlen = ev.largest_ack - sctx.unacked_offset;
+			
+    if(rmlen > 0) {
+        id_t send_buf_id = id(get_flow_id(ev), ev.stream_id);
+        instr_t instr = tx_flush_and_notify(send_buf_id, offset, rmlen);
+        sctx->unacked_offset = ev.largest_ack;
+        ctx->num_rtx = 0;
+    }
+
+    if (total_bytes_to_send > 0){
+
+    // Decide which stream should go first
+	uint32 sent_from_s0 = ctx.s0.next_offset;
+	uint32 sent_from_s1 = ctx.s1.next_offset;
+
+	uint62 first_stream = 0;
+	mtp_ctx_stream first_stream_ctx = ctx.s0;
+	int first_bytes_to_send = bytes_to_send0;
+
+	uint62 next_stream = 1;
+	mtp_ctx_stream next_stream_ctx = ctx.s1;
+	int next_bytes_to_send = bytes_to_send1;
+
+	bool cond1 = sent_from_s0 > sent_from_s1 && sent_from_s0 > sent_from_s1 + QUIC_SCHED_CHUNK; //100KB
+	bool cond2 = sent_from_s0 < sent_from_s1 && sent_from_s1 < sent_from_s0 + QUIC_SCHED_CHUNK; // 100KB
+	bool cond3 = bytes_to_send0 <= 0;
+
+	if (cond1 || cond2 || cond3){
+		first_stream = 1;
+		first_stream_ctx = ctx.s1;
+		first_bytes_to_send = bytes_to_send1;
+
+		next_stream = 0;
+		next_stream_ctx = ctx.s0;
+		next_bytes_to_send = bytes_to_send0;
+	}
+
+	int bytes_from_first = MIN(first_bytes_to_send, remaining_in_cwnd);
+	int bytes_from_next = 0;
+	if (bytes_from_first < remaining_in_cwnd){
+		bytes_from_next = MIN(next_bytes_to_send, (remaining_in_cwnd - bytes_from_first));
+	}
+
+	// Generating from first
+	{
+        StreamFrameBP fbp;
+        fbp.stream_id = first_stream;
+        ACKFrameBP abp;
+        abp.stream_id = first_stream;
+        QLiteBP bp;
+
+        bp.udp.source = ctx.local_port;
+        bp.udp.dest = ctx.remote_port;
+
+        fbp.offset = first_stream_ctx.next_offset;        
+
+        abp.largest_ack = first_stream_ctx.recv_next;
+        abp.max_stream_data = first_stream_ctx.rwnd_size;
+		// if (advertised_window == 0) first_stream_ctx.adv_zero_wnd = TRUE;
+
+        id_t buf_id = id(get_flow_id(ev), first_stream)
+        fbp.data = bp.data = unseg_data(buf_id, first_stream_ctx.next_offset, bytes_from_first, SMSS, 
+                                [StreamFrameBP::offset, first_stream_ctx.next_offset, prev.hdr.offset + prev.payload_len]);
+
+
+        bp.frames.add(fbp);
+        bp.frames.add(abp);
+
+		first_stream_ctx.next_offset += bytes_from_first;
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+	}
+    
+	
+	// Generating from next
+	if (bytes_from_next > 0){
+		StreamFrameBP fbp;
+        fbp.stream_id = next_stream;
+        ACKFrameBP abp;
+        abp.stream_id = next_stream;
+        QLiteBP bp;
+
+        bp.udp.source = ctx.local_port;
+        bp.udp.dest = ctx.remote_port;
+
+        fbp.offset = next_stream_ctx.next_offset;        
+
+        abp.largest_ack = next_stream_ctx.recv_next;
+        abp.max_stream_data = next_stream_ctx.rwnd_size;
+		// if (advertised_window == 0) next_stream_ctx.adv_zero_wnd = TRUE;
+
+        id_t buf_id = id(get_flow_id(ev), next_stream)
+        fbp.data = bp.data = unseg_data(buf_id, next_stream_ctx.next_offset, bytes_from_next, SMSS, 
+                                [StreamFrameBP::offset, next_stream_ctx.next_offset, prev.hdr.offset + prev.payload_len]);
+
+
+		next_stream_ctx.next_offset += bytes_from_next;
+
+        bp.frames.add(fbp);
+        bp.frames.add(abp);
+        
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+	}
+
+    instr_t instr = timer_start_instr(timeout, nanoseconds(ctx.RTO)); 
+    out.add(instr); 
+
+    return out;
+}
+
+
+list<instr_t> data_net_ep (qlite_data ev, qlite_context ctx, interm_out scratch) {
+    list<instr_t> out;
+    
+	mtp_ctx_stream stx = ev.stream_id == 0 ? ctx.s0 : ctx.s1;
+    id_t rcv_buf_id = id(get_flow_id(ev), ev.stream_id);
+    
+    uint32 last_rcvd_offset = ev.offset + ev.len;
+
+	if (stx.first_data_rcvd){
+        instr_t instr = new_rx_ordered_data(INF, rcv_buf_id);
+        ctx.first_data_rcvd = false;
+        out.add(instr); 
+    }
+
+	if (last_rcvd_offset < stx.recv_next) ||
+        (last_rcvd_offset > stx.max_recv_offset)) {
+		return out;
+	}
+
+    stx.meta_rwnd.set(ev.offset, last_rcvd_offset);
+	stx.meta.slide()
+    stx.recv_next = stx.meta_rwnd.head();
+
+    RBPut(mtcp->rbm_rcv, rcvbuf, ev_payload, ev_payloadlen, ev_seq);
+	MTP_PRINT("recv buffer merged len: %u\n", rcvbuf->merged_len);
+	MTP_PRINT("my calculated merged len: %u, recv_next: %u, last_flushed: %u\n", 
+			MTP_SEQ_SUB(stx->recv_next, stx->last_flushed, stx->last_flushed) - 1, 
+			stx->recv_next, stx->last_flushed);
+
+	stx->recv_next = rcvbuf->head_seq + rcvbuf->merged_len;
+
+    instr_t instr = add_data_seg(ev.hold_addr, ev.len, rcv_buf_id, ev.offset);
+    out.add(instr);
+
+	return out;
+}
+
+list<instr_t> send_ack (qlite_data ev, qlite_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    stx.adv_zero_wnd = false;
+    ACKFrameBP abp;
+    abp.stream_id = ev.stream_id;
+    abp.largest_acked = stx.recv_next;
+    abp.max_stream_data = stx.max_recv_offset;
+    
+    QLiteBP bp;
+    bp.source = ctx.local_port;
+    bp.dest = ctx.remote_port;
+    bp.frames.add(abp, ctx.local_ip, ctx.local_port);
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    return out;
+}
+
+list<instr_t> flush_ep (qlite_recv ev, qlite_context ctx, interm_out scratch) {
+    mtp_ctx_stream stx = ev.stream_id == 0 ? ctx.s0 : ctx.s1;
+    id_t rcv_buf_id = id(get_flow_id(ev), ev.stream_id);
+
+    uint32 data_avail = stx.rcv_next - stx.last_flushed - 1;
+    if (data_avail > ev.data_size){
+        data_avail = ev.data_size;
+    }
+    instr_t instr = flush_and_notify(rcv_buf_id, data_avail, ev.user_buf_addr);
+    stx.last_flushed += data_avail;
+    stx.max_recv_offset += data_avail;
+
+    out.add(instr);
+
+	if (stx.adv_zero_wnd) {
+		stx.adv_zero_wnd = false;
+        ACKFrameBP abp;
+        abp.stream_id = ev.stream_id;
+        abp.largest_acked = stx.recv_next;
+        abp.max_stream_data = stx.max_recv_offset;
+		
+        QLiteBP bp;
+        bp.source = ctx.local_port;
+        bp.dest = ctx.remote_port;
+        bp.frames.add(abp);	
+        instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+        out.add(instr);
+	}
+
+	return out;
+}
+
+list<instr_t> timeout_ep (qlite_timeout ev, qlite_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    if (ctx.num_rtx < MAX_RTX){
+        ctx.num_rtx = ctx.num_rtx + 1;
+    }
+
+    if (ctx.num_rtx > ctx.max_num_rtx){
+        ctx.max_num_rtx = ctx.num_rtx;
+    }
+
+    uint8 backoff;  
+    backoff = MIN(ctx.num_rtx, MAX_BACKOFF);
+
+    uint32 rto_prev = ctx.rto;
+    ctx.rto = ((ctx.srtt >> 3) + ctx.rttvar) << backoff;
+    if (ctx.rto <= 0) {
+        ctx.rto = rto_prev;
+    }
+	
+    uint32 wnd = ctx.cwnd_size;
+    ctx.ssthresh = wnd / 2;
+    if (ctx.ssthresh < 2 * ctx.SMSS){
+        ctx.ssthresh = ctx.SMSS;
+    }
+    
+    // stream 0
+    mtp_ctx_stream stx = ctx.s0;
+    uint32 data_rest = stx.data_end - stx.unacked_offset;
+    uint32 effective_window = ctx.cwnd_size;
+    if(effective_window + stx.unacked_offset > stx.max_stream_data)
+        effective_window = stx.max_stream_data - stx.unacked_offset;
+    
+    uint32 bytes_to_send = 0;
+
+    if(stx.unacked_offset + effective_window < stx.next_offset) {
+        if(data_rest < effective_window)
+            bytes_to_send = data_rest;
+        else
+            bytes_to_send = effective_window;
+    } else {
+        uint32 window_avail = stx.unacked_offset + effective_window - stx.next_offset;
+        if(data_rest < window_avail)
+            bytes_to_send = data_rest;
+        else
+            bytes_to_send = window_avail;
+    }
+    if(bytes_to_send > SMSS)
+        bytes_to_send = SMSS;
+
+    QLiteBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dest_port = ctx.remote_port;
+    StreamFrameBP fbp;
+    fbp.offset = stx.unacked_offset;
+    id_t send_buf_id = id(get_flow_id(ev), 0);
+    fbp.data = seg_data(send_buf_id, stx.unacked_offset, bytes_to_send);
+    ACKFrameBP abp;
+    abp.largest_ack = stx.recv_next;
+
+    bp.frames.add(fbp);
+    bp.frames.add(abp);
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    // stream 1
+    stx = ctx.s1;
+    data_rest = stx.data_end - stx.unacked_offset;
+    effective_window = ctx.cwnd_size;
+    if(effective_window + stx.unacked_offset > stx.max_stream_data)
+        effective_window = stx.max_stream_data - stx.unacked_offset;
+    
+    bytes_to_send = 0;
+
+    if(stx.unacked_offset + effective_window < stx.next_offset) {
+        if(data_rest < effective_window)
+            bytes_to_send = data_rest;
+        else
+            bytes_to_send = effective_window;
+    } else {
+        uint32 window_avail = stx.unacked_offset + effective_window - stx.next_offset;
+        if(data_rest < window_avail)
+            bytes_to_send = data_rest;
+        else
+            bytes_to_send = window_avail;
+    }
+    if(bytes_to_send > SMSS)
+        bytes_to_send = SMSS;
+
+    bp.src_port = ctx.local_port;
+    bp.dest_port = ctx.remote_port;
+    StreamFrameBP fbp;
+    fbp.offset = stx.unacked_offset;
+    id_t send_buf_id = id(get_flow_id(ev), 1);
+    fbp.data = seg_data(send_buf_id, stx.unacked_offset, bytes_to_send);
+    ACKFrameBP abp;
+    abp.largest_ack = stx.recv_next;
+
+    bp.frames.add(fbp);
+    bp.frames.add(abp);
+
+    instr_t instr = pkt_gen_instr(ctx.local_ip, ctx.remote_ip, bp);
+    out.add(instr);
+
+    instr_t instr = timer_restart_instr(qlite_timeout, nanosecond(ctx.RTO));
+    out.add(instr);
+
+    return out;
+}
