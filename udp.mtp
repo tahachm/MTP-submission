@@ -1,0 +1,174 @@
+/**************  event declarations ***************/
+
+event UDP_SEND : APP_EVENT {
+    uint32 data_size;
+    addr_t addr;
+    uint32 local_ip;
+    uint32 remote_ip;
+    uint16 local_port;
+    uint16 remote_port;
+}
+
+event UDP_RECV : APP_EVENT {
+    uint32 data_size;
+    addr_t user_buf_addr;
+}
+
+event UDP_DATA : NET_EVENT {
+    uint32 data_len;
+    addr_t hold_addr;
+    uint32 src_ip;
+    uint16 src_port;
+    uint16 dest_port;
+}
+
+
+/**************  UDP packet blueprint  ***************/
+
+pkt_bp UDPBP {
+    uint16 src_port;
+    uint16 dest_port;
+    uint16 len;
+    uint16 checksum;
+    data_t data;
+}
+
+/****************** contexts and other structs **************/
+
+context udp_context {
+    uint32 local_ip;
+    uint32 remote_ip;
+    uint16 local_port;
+    uint16 remote_port;
+
+    bool first_data_rcvd;
+    uint32 recv_total;
+    uint32 last_flushed;
+}
+
+interm_output interm_out {
+    bool unused;
+}
+
+/****************** extracting events out of packets ********************/
+
+net_to_transp ntt_module {
+    net_header IPheader {
+        uint4 hdr_len;
+        uint16 tot_len;
+        uint16 identification;
+        uint3 flags;
+        uint8 ttl;
+        uint8 protocol;
+        uint16 hdrChecksum;
+        uint32 src_ip;
+        uint32 dst_ip;
+    }
+
+    list<event_t> parse_net_packet(pkt_t p, IPheader i) { 
+        list<event_t> out;
+        UDPBP pkt_bp;
+        p.extract(pkt_bp);
+
+        flow_id id(i.src_ip, i.dst_ip, p.src_port, p.dest_port);
+
+        if (len(pkt_bp.data) > 0) {
+            UDP_DATA ev;
+            ev.data_len = len(pkt_bp.data);
+            ev.hold_addr = pkt_bp.data.addr;
+            ev.src_ip = i.src_ip;
+            ev.src_port = pkt_bp.src_port;
+            ev.dest_port = pkt_bp.dest_port;
+            set_flow_id(ev, id);
+            out.add(ev);
+        }
+
+        return out;
+    }
+}
+
+/************************ event processor declarations **************************/
+
+list<instr_t> udp_send_ep (UDP_SEND ev, null_context ctx, interm_out scratch);
+list<instr_t> udp_data_ep (UDP_DATA ev, udp_context ctx, interm_out scratch);
+list<instr_t> udp_flush_ep (UDP_RECV ev, udp_context ctx, interm_out scratch);
+
+/*************************** dispatcher ************************/
+
+dispatch udp_disp {
+    UDP_SEND -> {udp_send_ep};
+    UDP_DATA -> {udp_data_ep};
+    UDP_RECV -> {udp_flush_ep};
+}
+
+/************************* event processor definitions ****************************/
+
+// Application send: generate a single UDP packet carrying the application buffer.
+list<instr_t> udp_send_ep (UDP_SEND ev, null_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    UDPBP bp;
+    bp.src_port = ev.local_port;
+    bp.dest_port = ev.remote_port;
+    // Length and checksum can be filled in by the target.
+
+    // No segmentation: send the entire buffer as one datagram.
+    bp.data = seg_data(ev.addr, ev.data_size);
+
+    instr_t instr = pkt_gen_instr(ev.local_ip, ev.remote_ip, bp);
+    out.add(instr);
+
+    return out;
+}
+
+// Network data arrival: append payload into a per-flow ordered receive buffer.
+list<instr_t> udp_data_ep (UDP_DATA ev, udp_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    if (ctx.first_data_rcvd == false) {
+        instr_t instr0 = new_rx_ordered_data(INF, get_flow_id(ev));
+        out.add(instr0);
+        ctx.first_data_rcvd = true;
+        ctx.recv_total = 0;
+        ctx.last_flushed = 0;
+    }
+
+    // Append this datagram's bytes at the end of the per-flow stream.
+    uint32 offset = ctx.recv_total;
+    instr_t instr = add_data_seg(ev.hold_addr, ev.data_len, get_flow_id(ev), offset);
+    out.add(instr);
+
+    ctx.recv_total = ctx.recv_total + ev.data_len;
+
+    return out;
+}
+
+// Application receive: flush up to data_size bytes from the per-flow buffer.
+list<instr_t> udp_flush_ep (UDP_RECV ev, udp_context ctx, interm_out scratch) {
+    list<instr_t> out;
+
+    if (ctx.first_data_rcvd == false) {
+        return out;
+    }
+
+    uint32 available = ctx.recv_total - ctx.last_flushed;
+    if (available == 0) {
+        return out;
+    }
+
+    uint32 to_flush = ev.data_size;
+    if (to_flush > available) {
+        to_flush = available;
+    }
+
+    if (to_flush == 0) {
+        return out;
+    }
+
+    instr_t instr = flush_and_notify(get_flow_id(ev), to_flush, ev.user_buf_addr);
+    out.add(instr);
+
+    ctx.last_flushed = ctx.last_flushed + to_flush;
+
+    return out;
+}
